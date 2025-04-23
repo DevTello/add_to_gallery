@@ -12,6 +12,7 @@ import android.os.Build
 import android.os.Environment
 import android.provider.MediaStore
 import android.util.Log
+import android.webkit.MimeTypeMap
 import android.widget.Toast
 import androidx.annotation.NonNull
 import io.flutter.embedding.engine.plugins.FlutterPlugin
@@ -45,6 +46,15 @@ class AddToGalleryPlugin : FlutterPlugin, MethodCallHandler {
             val path = call.argument<String>("path")!!
             val contentResolver: ContentResolver = context.contentResolver;
             try {
+                val file = File(path)
+                if (!file.exists()) {
+                    result.error("file_not_exist", "File not found at path: $path", null)
+                    return
+                }
+                // Determine MIME type from file extension
+                val extension = MimeTypeMap.getFileExtensionFromUrl(file.path)
+                val mimeType = MimeTypeMap.getSingleton().getMimeTypeFromExtension(extension) ?: "application/octet-stream" // Default if type not found
+
                 if (Build.VERSION.SDK_INT < Build.VERSION_CODES.Q) {
                     //
                     // Android 9 and below
@@ -54,9 +64,9 @@ class AddToGalleryPlugin : FlutterPlugin, MethodCallHandler {
                     if (!dir.exists()) {
                         dir.mkdirs();
                     }
-                    val file = File(dir, File(path).name)
+                    val fileCopy = File(dir, File(path).name)
                     try {
-                        val output = FileOutputStream(file)
+                        val output = FileOutputStream(fileCopy)
                         val inS: InputStream = FileInputStream(File(path))
                         val buf = ByteArray(1024)
                         var len: Int
@@ -67,50 +77,108 @@ class AddToGalleryPlugin : FlutterPlugin, MethodCallHandler {
                         output.close()
                         // Copy image into  Gallery
                         val values = ContentValues()
-                        values.put(MediaStore.Images.Media.DATE_TAKEN, System.currentTimeMillis())
-                        values.put(MediaStore.Images.Media.MIME_TYPE, "images/*")
-                        values.put(MediaStore.MediaColumns.DATA, file.path)
-                        contentResolver.insert(MediaStore.Images.Media.EXTERNAL_CONTENT_URI, values)
-                        result.success(file.path)
+                        val collectionUri: Uri
+
+                        when {
+                            mimeType.startsWith("image/") -> {
+                                collectionUri = MediaStore.Images.Media.EXTERNAL_CONTENT_URI
+                                values.put(MediaStore.Images.Media.TITLE, fileCopy.name)
+                                values.put(MediaStore.Images.Media.DISPLAY_NAME, fileCopy.name)
+                                values.put(MediaStore.Images.Media.MIME_TYPE, mimeType)
+                                values.put(MediaStore.MediaColumns.DATA, fileCopy.path)
+                            }
+                            mimeType.startsWith("video/") -> {
+                                collectionUri = MediaStore.Video.Media.EXTERNAL_CONTENT_URI
+                                values.put(MediaStore.Video.Media.TITLE, fileCopy.name)
+                                values.put(MediaStore.Video.Media.DISPLAY_NAME, fileCopy.name)
+                                values.put(MediaStore.Video.Media.MIME_TYPE, mimeType)
+                                values.put(MediaStore.MediaColumns.DATA, fileCopy.path)
+                            }
+                            // Add audio or other types if needed
+                            else -> {
+                                // Handle unsupported type - maybe default to Images or throw error?
+                                // For now, defaulting to Images might cause issues with non-media files.
+                                // Let's return an error for unsupported types for clarity.
+                                result.error("unsupported_type", "Unsupported MIME type: $mimeType", null)
+                                return
+                            }
+                        }
+                        try {
+                            contentResolver.insert(collectionUri, values)
+                            result.success(fileCopy.path)
+                        } catch (e: java.lang.Exception) {
+                            e.printStackTrace()
+                            result.error("error", e.message, e.toString())
+                        }
                     } catch (e: java.lang.Exception) {
                         e.printStackTrace()
-                        result.error("error", null, null)
+                        result.error("error", e.message, e.toString())
                     }
                 } else {
                     //
                     // Android 10 and above
                     //
+                    val collection: Uri
+                    val relativePath: String
+
+                    when {
+                        mimeType.startsWith("image/") -> {
+                            collection = MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                            relativePath = Environment.DIRECTORY_PICTURES
+                        }
+                        mimeType.startsWith("video/") -> {
+                            collection = MediaStore.Video.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                            relativePath = Environment.DIRECTORY_MOVIES
+                        }
+                        mimeType.startsWith("audio/") -> {
+                            collection = MediaStore.Audio.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                            relativePath = Environment.DIRECTORY_MUSIC
+                        }
+                        else -> {
+                            // On Q+, we can use Downloads for generic types
+                            collection = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+                            relativePath = Environment.DIRECTORY_DOWNLOADS
+                        }
+                    }
+
                     val value = ContentValues().apply {
                         put(MediaStore.Images.Media.DISPLAY_NAME, File(path).name)
-                        put(MediaStore.Images.Media.MIME_TYPE, "images/*")
-                        put(MediaStore.MediaColumns.RELATIVE_PATH, "Pictures/$album")
+                        put(MediaStore.Images.Media.MIME_TYPE, mimeType)
+                        put(MediaStore.MediaColumns.RELATIVE_PATH, "$relativePath/$album")
                         put(MediaStore.Images.Media.IS_PENDING, 1)
                     }
+
                     val resolver = contentResolver
-                    val collection = MediaStore.Images.Media.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
                     val item = resolver.insert(collection, value)
                     if (item != null) {
-                        resolver.openOutputStream(item).use { out ->
-                            val inS: InputStream = FileInputStream(File(path))
-                            val buf = ByteArray(1024)
-                            var len: Int
-                            while (inS.read(buf).also { len = it } > 0) {
-                                out?.write(buf, 0, len)
+                        try {
+                            resolver.openOutputStream(item).use { out ->
+                                val inS: InputStream = FileInputStream(File(path))
+                                val buf = ByteArray(1024)
+                                var len: Int
+                                while (inS.read(buf).also { len = it } > 0) {
+                                    out?.write(buf, 0, len)
+                                }
+                                inS.close()
+                                out?.close()
                             }
-                            inS.close()
-                            out?.close()
+                            value.clear()
+                            value.put(MediaStore.Images.Media.IS_PENDING, 0)
+                            resolver.update(item, value, null, null)
+                            result.success(getRealPathFromURI(context, item))
+                        } catch (e: Exception) {
+                            // If writing fails, delete the pending item
+                            resolver.delete(item, null, null)
+                            e.printStackTrace()
+                            result.error("write_failed", "Failed to write file to MediaStore", e.toString())
                         }
-                        value.clear()
-                        value.put(MediaStore.Images.Media.IS_PENDING, 0)
-                        resolver.update(item, value, null, null)
-                        result.success(getRealPathFromURI(context, item))
                     } else {
-                        result.error("error", null, null)
+                        result.error("insert_failed", "Failed to insert item into MediaStore", null)
                     }
                 }
             } catch (e: Exception) {
-                result.error("error", null, null)
                 e.printStackTrace()
+                result.error("error", e.message, e.toString())
             }
         } else {
             result.notImplemented()
